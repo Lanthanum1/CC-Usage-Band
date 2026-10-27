@@ -1,0 +1,19 @@
+{
+  "name": "usage-band",
+  "version": "1.0.7",
+  "description": "A band above the prompt showing your 5-hour and 7-day limits, context window and prompt-cache hit rate, styled for the terminal and the desktop app",
+  "author": {
+    "name": "Jetson Chan"
+  },
+  "repository": "https://github.com/Lanthanum1/CC-Usage-Band",
+  "license": "MIT",
+  "keywords": [
+    "usage",
+    "rate-limit",
+    "context",
+    "cache",
+    "status",
+    "mod"
+  ],
+  "types": "./types/index.d.ts"
+}
