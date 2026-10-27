@@ -1,13 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Limit, Measure, Style, TurnTokens } from '../types'
+import type { Flash, Limit, Measure, Style, TurnTokens } from '../types'
 
 const measure = atom({ plugin: 'usage-band', key: 'measure' } as const, null)
 const turn = atom({ plugin: 'usage-band', key: 'turn' } as const, null)
 const now = atom({ plugin: 'usage-band', key: 'now' } as const, 0)
 const phase = atom({ plugin: 'usage-band', key: 'phase' } as const, 0)
 const style = atom({ plugin: 'usage-band', key: 'style' } as const, 'unicode')
+const flash = atom({ plugin: 'usage-band', key: 'flash' } as const, null)
 
 // One hue per metric; RED takes over only when a metric is in trouble
 const HUE = { five: '#5cc4d6', seven: '#e8a25f', ctx: '#9aa5f5', cache: '#72cf9f' }
@@ -16,6 +17,11 @@ const TRACK = '#4a4f5c'
 const FRAME_MS = 200
 // How often a session checks the shared store for a newer limit reading
 const POLL_MS = 15_000
+// A figure that changes sweeps its shine once: SHINE_S on the desktop, SWEEP frames in the
+// terminal (8 cells and the glow's run-out). The flash is cleared once both are long over.
+const SHINE_S = 1.6
+const SWEEP = 13
+const FLASH_MS = 5_000
 const PREVIEW = 'usage-band-preview'
 
 export const GLYPHS: Record<Style, { ctx: string; hit: string; fill: string; track: string }> = {
@@ -83,6 +89,19 @@ export const windowOf = (m: Measure | null, kind: string, at: number): Limit | u
 }
 
 export type Span = { text: string; color?: string; dim?: boolean }
+
+const LIMITS = ['five_hour', 'seven_day'] as const
+
+// The figures a flash is keyed by, as the band shows them
+export const figures = (m: Measure | null, at: number): Record<string, string> => {
+  const out: Record<string, string> = {}
+  for (const kind of LIMITS) {
+    const l = windowOf(m, kind, at)
+    if (l) out[kind] = String(Math.round(l.percentUsed))
+  }
+  if (m) out.ctx = fmtTokens(m.context.tokens ?? 0)
+  return out
+}
 export type Look = { style: Style; colors: 'true' | '256' }
 
 const SEP: Span = { text: '  ' }
@@ -90,12 +109,12 @@ const SEP: Span = { text: '  ' }
 export const width = (spans: Span[]) => spans.reduce((n, s) => n + [...s.text].length, 0)
 
 // A bar whose filled part runs from a deep shade of its color to a bright one,
-// with a soft highlight sweeping left to right on top
-export const bar = (pct: number, cells: number, color: string, frame: number, s: Style = 'unicode'): Span[] => {
+// with a soft highlight sweeping left to right on top; a null frame draws it at rest
+export const bar = (pct: number, cells: number, color: string, frame: number | null, s: Style = 'unicode'): Span[] => {
   const g = GLYPHS[s]
   const filled = Math.max(pct > 0 ? 1 : 0, Math.min(cells, Math.round((pct / 100) * cells)))
   // Same period for every bar, so all highlights travel in step
-  const pos = frame % (cells + 5)
+  const pos = frame === null ? -2 : frame % (cells + 5)
   const spans: Span[] = []
   for (let i = 0; i < filled; i++) {
     const shade = filled === 1 ? 0 : -0.15 + (0.35 * i) / (filled - 1)
@@ -112,18 +131,20 @@ export const layout = (
   t: TurnTokens | null,
   at: number,
   detail: 0 | 1 | 2,
-  frame = 0,
+  frame: number | null = 0,
   look: Look = { style: 'unicode', colors: 'true' },
+  lit: readonly string[] = LIMITS,
 ): Span[] => {
   const g = GLYPHS[look.style]
   const groups: Span[][] = []
 
   const limit = (label: string, l: Limit | undefined, hue: string) => {
     if (!l) return
+    const f = lit.includes(l.kind) ? frame : null
     const pct = Math.round(l.percentUsed)
     const color = pct >= 80 ? RED : hue
     const out: Span[] = [{ text: `${label} `, color }]
-    if (detail === 2) out.push(...bar(pct, 8, color, frame, look.style), { text: ' ' })
+    if (detail === 2) out.push(...bar(pct, 8, color, f, look.style), { text: ' ' })
     out.push({ text: `${pct}%`, color })
     if (detail >= 1 && l.resetsAt) out.push({ text: ` · ${fmtLeft(Date.parse(l.resetsAt) - at)}`, dim: true })
     groups.push(out)
@@ -154,9 +175,9 @@ export const layout = (
   return look.colors === '256' ? spans.map(s => (s.color ? { ...s, color: to256(s.color) } : s)) : spans
 }
 
-const fit = (m: Measure | null, t: TurnTokens | null, at: number, cols: number, frame: number, look: Look) =>
-  ([2, 1, 0] as const).map(d => layout(m, t, at, d, frame, look)).find(s => width(s) <= cols) ??
-  layout(m, t, at, 0, frame, look)
+const fit = (m: Measure | null, t: TurnTokens | null, at: number, cols: number, frame: number | null, look: Look, lit: readonly string[]) =>
+  ([2, 1, 0] as const).map(d => layout(m, t, at, d, frame, look, lit)).find(s => width(s) <= cols) ??
+  layout(m, t, at, 0, frame, look, lit)
 
 
 // ---- Desktop: the band is one SVG drawn as a plain image. The SMIL shine runs in an image too,
@@ -186,13 +207,19 @@ const ink = (hue: string, x: number, y: number, v: string, size: number) =>
 const mute = (x: number, y: number, v: string, size: number) =>
   `<text x="${x}" y="${y}" font-size="${size}" ${pinW(v, size)} class="mute">${esc(v)}</text>`
 
+// One pass of the shine over [x, x + w], clipped to the lit part; it plays as the image loads,
+// so it runs again only when the band is drawn with this group's figure changed
+const sweep = (clip: string, x: number, y: number, h: number, w: number) =>
+  `<g clip-path="url(#${clip})"><rect x="${x - 18}" y="${y}" width="18" height="${h}" fill="url(#shine)">` +
+  `<animate attributeName="x" values="${x - 18};${x + w}" dur="${SHINE_S}s" fill="freeze"/></rect></g>`
+
 // stat: type, icons and rules; motion: bars and dots with their shine
 type Layers = { stat: string; motion: string }
 type Group = { width: number; draw: (x: number) => Layers }
 
 // 5h 60% ▬▬▬▬── 1h49m: the figure first, so the state reads before the bar
 // 5h ▬▬▬▬▬▬──── 69% │ 1h31m: label, bar, figure, then when it resets
-const limitGroup = (id: string, label: string, l: Limit, hue: string, at: number): Group => {
+const limitGroup = (id: string, label: string, l: Limit, hue: string, at: number, shine: boolean): Group => {
   const pct = Math.round(l.percentUsed)
   const color = pct >= 80 ? RED : hue
   const pctText = `${pct}%`
@@ -212,10 +239,9 @@ const limitGroup = (id: string, label: string, l: Limit, hue: string, at: number
         `<defs><clipPath id="c-${id}"><rect x="${bx}" y="${y}" width="${fillW}" height="${D.barH}" rx="${r}"/></clipPath></defs>`,
         `<rect x="${bx}" y="${y}" width="${D.barW}" height="${D.barH}" rx="${r}" class="track" style="--h:${color}"/>`,
         `<rect x="${bx}" y="${y}" width="${fillW}" height="${D.barH}" rx="${r}" fill="${lighten(color, -0.12)}"/>`,
-        // The shine crosses the whole bar on one shared clock and shows only over the fill,
-        // so both bars' shines sit at the same spot at every moment
-        `<g clip-path="url(#c-${id})"><rect y="${y}" width="18" height="${D.barH}" fill="url(#shine)">` +
-          `<animate attributeName="x" values="${bx - 18};${bx + D.barW};${bx + D.barW}" keyTimes="0;0.62;1" dur="2.6s" repeatCount="indefinite"/></rect></g>`,
+        // The shine crosses the whole bar once, showing only over the fill, so bars that change
+        // together sweep in step
+        shine ? sweep(`c-${id}`, bx, y, D.barH, D.barW) : '',
       ]
       const stat = [ink(color, x, 19.5, label, D.base), ink(color, px, 19.5, pctText, D.base)]
       if (left) {
@@ -265,7 +291,7 @@ const typeGroup = (icon: (c: string) => string, hue: string, num: string, suffix
 // row left to right before the bottom one, with the same shine over the lit dots
 // Rows sit so the dots' outer edges meet the CAP band: CAP.top + r and CAP.top + CAP.h - r
 const DOTS = { cols: 10, pitch: 5, r: 1.6, rows: [11.35, 18.15] }
-const ctxGroup = (hue: string, tokens: number, window: number, pct: number): Group => {
+const ctxGroup = (hue: string, tokens: number, window: number, pct: number, shine: boolean): Group => {
   const lit = Math.min(DOTS.cols * 2, Math.round((pct / 100) * DOTS.cols * 2))
   const num = fmtTokens(tokens)
   const suffix = `/${fmtTokens(window)}`
@@ -289,8 +315,7 @@ const ctxGroup = (hue: string, tokens: number, window: number, pct: number): Gro
           `<defs><clipPath id="c-ctx">${on}</clipPath></defs>` +
           `<g class="track" style="--h:${hue}">${off}</g>` +
           `<g fill="${lighten(hue, -0.12)}">${on}</g>` +
-          `<g clip-path="url(#c-ctx)"><rect y="8" width="18" height="14" fill="url(#shine)">` +
-          `<animate attributeName="x" values="${mx - 18};${mx + matrixW};${mx + matrixW}" keyTimes="0;0.62;1" dur="2.6s" repeatCount="indefinite"/></rect></g>`,
+          (shine ? sweep('c-ctx', mx, 8, 14, matrixW) : ''),
       }
     },
   }
@@ -315,16 +340,16 @@ const wrap = (width: number, body: string) =>
 
 export type Part = Layers & { width: number; alt: string }
 
-export const desktopParts = (m: Measure | null, t: TurnTokens | null, at: number): Part[] => {
+export const desktopParts = (m: Measure | null, t: TurnTokens | null, at: number, lit: readonly string[] = []): Part[] => {
   const groups: { g: Group; alt: string }[] = []
   const five = windowOf(m, 'five_hour', at)
   const seven = windowOf(m, 'seven_day', at)
-  if (five) groups.push({ g: limitGroup('5h', '5h', five, HUE.five, at), alt: `5-hour limit ${Math.round(five.percentUsed)}% used` })
-  if (seven) groups.push({ g: limitGroup('7d', '7d', seven, HUE.seven, at), alt: `7-day limit ${Math.round(seven.percentUsed)}% used` })
+  if (five) groups.push({ g: limitGroup('5h', '5h', five, HUE.five, at, lit.includes('five_hour')), alt: `5-hour limit ${Math.round(five.percentUsed)}% used` })
+  if (seven) groups.push({ g: limitGroup('7d', '7d', seven, HUE.seven, at, lit.includes('seven_day')), alt: `7-day limit ${Math.round(seven.percentUsed)}% used` })
   if (m) {
     const pct = m.context.percent ?? 0
     groups.push({
-      g: ctxGroup(pct >= 80 ? RED : HUE.ctx, m.context.tokens ?? 0, m.context.window, pct),
+      g: ctxGroup(pct >= 80 ? RED : HUE.ctx, m.context.tokens ?? 0, m.context.window, pct, lit.includes('ctx')),
       alt: `context ${fmtTokens(m.context.tokens ?? 0)} of ${fmtTokens(m.context.window)}`,
     })
   }
@@ -338,10 +363,11 @@ export const desktopParts = (m: Measure | null, t: TurnTokens | null, at: number
 
 // One SVG for the whole band, so every shine runs on the same clock. Groups sit D.gap apart
 // with a hairline centred in each gap; the one inside a limit group is shorter and fainter.
-export const desktopSvg = (m: Measure | null, t: TurnTokens | null, at: number) => {
+// lit names the figures whose shine plays as this drawing loads.
+export const desktopSvg = (m: Measure | null, t: TurnTokens | null, at: number, lit: readonly string[] = []) => {
   let x = 0
   const body: string[] = []
-  desktopParts(m, t, at).forEach((p, i) => {
+  desktopParts(m, t, at, lit).forEach((p, i) => {
     if (i > 0) body.push(`<rect x="${Math.round(x - D.gap / 2)}" y="7" width="1" height="16" class="sep"/>`)
     body.push(`<g transform="translate(${x} 0)">${p.stat}${p.motion}</g>`)
     x += p.width + D.gap
@@ -369,7 +395,9 @@ const shown = (m: Measure | null, t: TurnTokens | null, at: number) => desktopSv
 
 const tick = async ($: EngineInterface) => {
   const at = await $.clock.now()
-  const [m, t, was] = [await read($, measure), await read($, turn), await read($, now)]
+  const [m, t, was, f] = [await read($, measure), await read($, turn), await read($, now), await read($, flash)]
+  // A spent flash is dropped, so a later redraw (a countdown moving on) plays no shine
+  if (f && at - f.at >= FLASH_MS) await update($, flash, () => null)
   if (was && shown(m, t, was) === shown(m, t, at)) return
   await update($, now, () => at)
 }
@@ -401,6 +429,12 @@ const adopt = async ($: EngineInterface, seenAt: number): Promise<number> => {
 const setMeasure = async ($: EngineInterface, next: Measure) => {
   const [m, t, at] = [await read($, measure), await read($, turn), await read($, now)]
   if (m && shown(m, t, at) === shown(next, t, at)) return
+  const [was, is] = [figures(m, at), figures(next, at)]
+  const keys = Object.keys(is).filter(k => is[k] !== was[k])
+  if (keys.length > 0) {
+    const [clock, frame] = [await $.clock.now(), await read($, phase)]
+    await update($, flash, () => ({ keys, at: clock, frame }))
+  }
   await update($, measure, () => next)
 }
 
@@ -537,12 +571,13 @@ export const register: Register = on => {
     const m = await read($, measure)
     const t = await read($, turn)
     const at = await read($, now)
+    const f = await read($, flash)
     if (e.props.hasSurvey || (m === null && t === null)) return next(e)
 
     // Desktop and mobile animate inside the SVG, so they never read the frame counter
     if (e.surface === 'desktop' || e.surface === 'mobile') {
       const { Box, Svg } = $.ui.resolve(e)
-      const { svg, width, height } = desktopSvg(m, t, at)
+      const { svg, width, height } = desktopSvg(m, t, at, f?.keys)
       return (
         <Box flexDirection="row" justifyContent="center" flexGrow={1} paddingX={1}>
           <Svg source={svg} alt={describe(m, t, at)} width={width} height={height} />
@@ -552,14 +587,17 @@ export const register: Register = on => {
 
     if (!isAnimating) {
       isAnimating = true
-      $.clock.every(FRAME_MS, () => {
-        void update($, phase, f => (f ?? 0) + 1)
+      // Frames advance only while a sweep is under way, so a resting band is never redrawn
+      $.clock.every(FRAME_MS, async () => {
+        const [held, p] = [await read($, flash), await read($, phase)]
+        if (held && p - held.frame < SWEEP) await update($, phase, n => (n ?? 0) + 1)
       })
     }
-    const frame = await read($, phase)
+    const p = await read($, phase)
+    const frame = f && p - f.frame < SWEEP ? p - f.frame : null
     // The terminal font decides icons; other surfaces (vscode) get the plain set
     const s = e.surface === 'terminal' ? await read($, style) : 'unicode'
-    const spans = fit(m, t, at, e.props.bodyColumns - 2, frame, { style: s, colors: 'true' })
+    const spans = fit(m, t, at, e.props.bodyColumns - 2, frame, { style: s, colors: 'true' }, f?.keys ?? [])
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="row" flexWrap="wrap" paddingX={1}>

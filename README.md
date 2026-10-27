@@ -46,7 +46,7 @@ English · [简体中文](./README.zh-CN.md)
 | **Cache hit rate** (target icon) | How much of the last turn's input the prompt cache served |
 
 - **Glanceable.** Each metric has its own color. It turns red only when it needs you: a limit or the context past 80%, or a cache hit rate under 50%.
-- **Alive, not noisy.** A slow shine sweeps across the limit bars, every bar in step.
+- **Alive, not noisy.** When a figure changes, a shine sweeps once across its bar; otherwise the band holds still.
 - **Native on both surfaces.** Terminal: a character line with Nerd Font or Unicode icons that fits itself to the window width. Desktop app: a centered SVG row with bars, a 2×10 dot matrix for the context window, and light and dark mode.
 - **Light.** No files read, no processes, no network. It only listens to the usage figures Claude Code already has.
 

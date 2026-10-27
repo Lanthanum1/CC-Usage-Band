@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bar, describe, desktopSvg, detectStyle, fmtLeft, fmtTokens, hitRate, layout, to256, width, windowOf } from '../hooks/register'
+import { bar, describe, desktopSvg, figures, detectStyle, fmtLeft, fmtTokens, hitRate, layout, to256, width, windowOf } from '../hooks/register'
 import type { Measure } from '../types'
 
 const BAND = {
@@ -21,6 +21,7 @@ test('formats tokens, countdowns and hit rate', async () => {
 })
 
 test('band shows limits, context and the last turn on terminal and desktop', async ($, on) => {
+  mock.clock(on)
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('turn.complete', () => ({ text: '' }))
 
@@ -240,5 +241,76 @@ test('an idle session adopts a newer limit reading another session shared', asyn
     changed: ['context'],
   })
   expect(await alt()).toContain('5-hour limit 35% used')
+  await ui.unmount()
+})
+
+test('the desktop shine plays once, and only on the figures that changed', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  const measureWith = (five: number, tokens: number) =>
+    $.session.measure({
+      context: { tokens, window: 1_000_000, percent: tokens / 10_000 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: five },
+        { kind: 'seven_day', percentUsed: 40 },
+      ],
+      changed: ['context', 'rateLimits'],
+    })
+  const shines = (svg: unknown) => String(svg).match(/<animate /g)?.length ?? 0
+
+  await measureWith(20, 100_000)
+  const ui = await $.ui.mount({ plugin: 'usage-band', surface: 'desktop', ...BAND })
+  const svg = async () => (await ui.find({ type: 'Svg' }))?.props.source
+  // The first reading shows every figure for the first time
+  expect(shines(await svg())).toBe(3)
+  expect(String(await svg())).not.toContain('indefinite')
+
+  // Only the 5h figure moves: its bar alone sweeps
+  await clock.advance(20_000)
+  await measureWith(21, 100_000)
+  expect(shines(await svg())).toBe(1)
+  expect(String(await svg())).toMatch(/clip-path="url\(#c-5h\)"><rect[^>]*><animate/)
+
+  // Once the flash is spent, the next redraw is still
+  await clock.advance(60_000)
+  await measureWith(21, 100_000)
+  expect(shines(await svg())).toBe(0)
+  await ui.unmount()
+})
+
+test('figures key what the band shows, rounded as shown', async () => {
+  const m: Measure = {
+    context: { tokens: 100_040, window: 1_000_000, percent: 10 },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 20.4 }],
+  }
+  expect(figures(m, 0)).toEqual({ five_hour: '20', ctx: '100K' })
+  expect(figures(null, 0)).toEqual({})
+})
+
+test('the terminal bar rests until a figure changes, then sweeps once', async ($, on) => {
+  const clock = mock.clock(on)
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  const measureWith = (five: number) =>
+    $.session.measure({
+      context: { tokens: 100_000, window: 1_000_000, percent: 10 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: five }],
+      changed: ['context', 'rateLimits'],
+    })
+  await measureWith(50)
+  const ui = await $.ui.mount({ plugin: 'usage-band', surface: 'terminal', ...BAND })
+  const cells = async () =>
+    JSON.stringify((await ui.findAll({ type: 'Text', text: '■' })).map(n => n.props.color))
+  // Let the first sweep run out, then the bar holds still
+  await clock.advance(200 * 20)
+  const rest = await cells()
+  await clock.advance(1_000)
+  expect(await cells()).toBe(rest)
+
+  await clock.advance(20_000)
+  await measureWith(60)
+  const lit = await cells()
+  await clock.advance(200)
+  expect(await cells()).not.toBe(lit)
   await ui.unmount()
 })

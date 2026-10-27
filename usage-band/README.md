@@ -6,7 +6,7 @@ A Claude Code mod that puts a one-line band above the prompt with what you need 
 - **Context** — tokens in the context window out of its size
 - **Cache hit** — how much of the last turn's input the prompt cache served
 
-Each metric has its own color and turns red when it needs attention: a limit or the context past 80%, or a cache hit rate under 50%. The limit bars carry a slow shine that sweeps left to right, in step across bars.
+Each metric has its own color and turns red when it needs attention: a limit or the context past 80%, or a cache hit rate under 50%. When a figure changes, a shine sweeps once across its bar; the rest of the time the band holds still.
 
 ## How it looks
 
